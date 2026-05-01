@@ -14,7 +14,7 @@ import type {
 import type { AgentStateType } from "../../state.js";
 import type { Trip } from "../../../types/trip.js";
 
-const useFlightApi = process.env.USE_FLIGHT_API === "false";
+const useFlightApi = process.env.USE_FLIGHT_API === "true";
 const GENERATE_SUMMARIES = process.env.GENERATE_SUMMARIES === "true";
 
 const model = loadModel("fast");
