@@ -98,6 +98,10 @@ export const searchFlights = tool(
     // }
 
     if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      console.error(
+        `[searchFlights] Amadeus ${response.status} ${response.statusText}: ${body.slice(0, 500)}`,
+      );
       return JSON.stringify({ error: true, message: "Flight API unavailable" });
     }
 
