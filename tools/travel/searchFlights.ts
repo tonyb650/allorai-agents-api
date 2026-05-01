@@ -98,9 +98,7 @@ export const searchFlights = tool(
     // }
 
     if (!response.ok) {
-      // API error - don't expose technical details to user
-      // Just throw a simple error that will be caught by the agent
-      throw new Error("Flight API unavailable");
+      return JSON.stringify({ error: true, message: "Flight API unavailable" });
     }
 
     const rawData = await response.json();
