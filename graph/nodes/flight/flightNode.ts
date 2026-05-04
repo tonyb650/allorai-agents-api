@@ -1,16 +1,12 @@
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
-import { SystemMessage, AIMessage } from "@langchain/core/messages";
+import { SystemMessage, HumanMessage, AIMessage } from "@langchain/core/messages";
 import { loadModel } from "../../../utils/agents/loadModel.js";
 import { flightTools } from "./tools.js";
 import { summarizeFlights } from "./utils/summarizeFlights.js";
 import { extractLastToolJson } from "../../../utils/agents/extractLastToolJson.js";
-import { generator } from "../../../utils/agents/generator.js";
 import { nanoid } from "nanoid";
-import type {
-  FlightResults,
-  FlightLeg,
-  AirportInfo,
-} from "../../../types/flight/flights.js";
+import * as z from "zod";
+import type { FlightResults } from "../../../types/flight/flights.js";
 import type { AgentStateType } from "../../state.js";
 import type { Trip } from "../../../types/trip.js";
 
@@ -18,6 +14,54 @@ const useFlightApi = process.env.USE_FLIGHT_API === "true";
 const GENERATE_SUMMARIES = process.env.GENERATE_SUMMARIES === "true";
 
 const model = loadModel("fast");
+// "standard" tier (e.g. gpt-4o-mini) is enough here — withStructuredOutput
+// enforces shape, so we trade model intelligence for latency.
+const flightGenModel = loadModel("standard");
+
+// Mirrors the api-gateway's FlightSchema. Used by the LLM-generator path to
+// constrain the model output via withStructuredOutput, which is enforced at
+// the provider API level (no prompt-engineering drift).
+const flightOutputSchema = z.object({
+  flights: z.array(
+    z.object({
+      price: z.string().describe("Total round-trip price as a string, e.g. '423.50'"),
+      currency: z.string().describe("Currency code, e.g. 'USD'"),
+      legs: z.array(
+        z.object({
+          direction: z.enum(["outbound", "return"]),
+          legDuration: z.string().describe("ISO 8601 duration string, e.g. 'PT5H30M'"),
+          segments: z.array(
+            z.object({
+              duration: z.string().describe("ISO 8601 duration string"),
+              departure: z.object({
+                airport: z.string().describe("3-letter IATA code"),
+                time: z.string().describe("ISO 8601 datetime string"),
+              }),
+              arrival: z.object({
+                airport: z.string().describe("3-letter IATA code"),
+                time: z.string().describe("ISO 8601 datetime string"),
+              }),
+              airline: z.string(),
+            }),
+          ),
+        }),
+      ),
+      destinationAirport: z.object({
+        name: z.string(),
+        iata_code: z.string().describe("3-letter IATA code"),
+        latitude_deg: z.number(),
+        longitude_deg: z.number(),
+      }),
+      destinationCity: z
+        .object({
+          name: z.string(),
+          latitude: z.number(),
+          longitude: z.number(),
+        })
+        .nullable(),
+    }),
+  ),
+});
 
 function getMissingFields(trip: Trip): string[] {
   const missing: string[] = [];
@@ -37,17 +81,6 @@ function buildTripContext(trip: Trip): Record<string, unknown> {
     budget: trip.budget,
     interests: trip.interests,
     constraints: trip.constraints,
-  };
-}
-
-function createFlightTemplate(): FlightResults {
-  return {
-    id: nanoid(),
-    price: null as unknown as number,
-    currency: null as unknown as string,
-    legs: null as unknown as FlightLeg[],
-    destinationAirport: null as unknown as AirportInfo,
-    destinationCity: null,
   };
 }
 
@@ -222,12 +255,23 @@ Missing: ${missingFields.join(", ")}`),
   }
 
   try {
-    const flights = await generator<FlightResults>({
-      data: Array.from({ length: 5 }, () => createFlightTemplate()),
-      context: buildTripContext(trip),
-      description:
-        "round-trip flight options. Each flight must have exactly 2 legs: one outbound (origin to destination) and one return (destination to origin). Each leg needs a direction ('outbound' or 'return'), legDuration, and a segments array. Each segment needs duration, departure (airport IATA code + ISO time), arrival (airport IATA code + ISO time), and airline name. Prices should be realistic USD values.",
-    });
+    const structuredModel = flightGenModel.withStructuredOutput(flightOutputSchema);
+    const tripContext = JSON.stringify(buildTripContext(trip), null, 2);
+
+    const { flights: generatedFlights } = await structuredModel.invoke([
+      new SystemMessage(`Generate 3 plausible round-trip flight options for the trip below.
+
+Rules:
+- Output must conform to the provided schema exactly.
+- Each flight has exactly 2 legs: one outbound, one return.
+- Use realistic flight times, durations, prices, and major airlines.
+- Provide approximate latitude/longitude (decimal degrees) for the destination airport and city.`),
+      new HumanMessage(`Trip details:\n${tripContext}`),
+    ]);
+
+    const flights = generatedFlights.map(
+      (f) => ({ id: nanoid(), ...f }) as unknown as FlightResults,
+    );
 
     const summary = GENERATE_SUMMARIES
       ? await summarizeFlights(flights, state.messages)
